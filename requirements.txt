@@ -1,0 +1,5 @@
+# Recoup's core agent is pure Python 3.10+ standard library - there is
+# nothing to install for the default (non-LLM) path.
+#
+# For optional Claude-assisted diagnosis and message drafting, see
+# requirements-llm.txt.

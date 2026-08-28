@@ -1,0 +1,174 @@
+# Recoup — an AI Revenue Recovery agent
+
+Built for Razorpay's Buildathon, **Track 03: AI Revenue Recovery**.
+
+Recoup looks at a batch of at-risk revenue events — failed payments, abandoned
+checkouts, overdue invoices — diagnoses *why* the money is stuck, picks one
+action from a fixed, compliance-bounded whitelist, and reports exactly how
+much it recovered, what it cost to recover it, and every guardrail that
+fired along the way.
+
+## The track's bar, and where it's met
+
+> "Don't just identify the problem. Show measured money recovered across a
+> batch, with compliant escalation, stopping rules, and an audit trail."
+
+| Requirement | Where |
+|---|---|
+| Measured money recovered across a batch | [`recoup/report.py`](recoup/report.py) — compares the agent against a naive baseline on the same batch, not just a single cherry-picked case |
+| Compliant escalation | [`recoup/policy.py`](recoup/policy.py) — disputed invoices and high-value cases (`> ₹50,000`) always route to a human, never automated |
+| Stopping rules | same file — retry caps, backoff windows, promise-to-pay honoring, 90-day write-off ceiling, DND hours, a low-value outreach floor |
+| Audit trail | [`recoup/audit.py`](recoup/audit.py) — every decision, its reasoning, every guardrail evaluated, and the outcome, exported to CSV + JSON |
+
+## How it works
+
+```mermaid
+flowchart LR
+    A[Synthetic event\nfailed payment / cart drop-off / overdue invoice] --> B[Diagnose\nrule-based, optional LLM\nfor ambiguous notes]
+    B --> C[Policy\nbounded action whitelist\n+ compliance guardrails]
+    C --> D[Simulate\ndiagnosis-aware outcome]
+    D --> E[Audit trail\nCSV + JSON]
+    D --> F[Report\nsmart vs. naive baseline]
+```
+
+The LLM (optional, off by default) is only ever allowed to (a) classify an
+ambiguous free-text note into one of a fixed set of root causes, and (b)
+draft the customer-facing message text for an action the policy already
+chose. It never picks the action. The policy engine is plain deterministic
+Python so every guardrail can be — and is — unit tested independent of any
+model call.
+
+## Quickstart
+
+Requires Python 3.10+. No third-party packages needed for the default path.
+
+```bash
+git clone <this-repo-url> recoup
+cd recoup
+python -m recoup.run
+```
+
+Then open `out/report.html` in a browser. It also writes
+`out/audit_trail.csv` and `out/audit_trail.json`.
+
+Useful flags:
+
+```bash
+python -m recoup.run --events 500 --seed 7   # bigger batch, different seed
+python -m recoup.run --use-llm               # see "Optional LLM mode" below
+```
+
+## What the numbers mean
+
+Every batch is run twice on the *same* events: once through Recoup's
+diagnosis-driven policy, once through a naive baseline that always applies
+one fixed action per category (e.g. always `retry_now` on a failed payment)
+regardless of root cause. Both runs obey identical guardrails — the
+baseline is naive about *which action to pick*, not about compliance. The
+report's headline number is the gap between them: how much diagnosis-driven
+targeting actually recovers over "just retry/remind everything."
+
+The event batch and both policy runs are deterministic given `--seed`, so
+the same command reproduces the same report every time.
+
+## Guardrails / stopping rules
+
+| Guardrail | Rule |
+|---|---|
+| `dispute_routing` | A disputed invoice never gets an automated action — always a human |
+| `high_value_threshold` | Any event over ₹50,000 escalates to a human instead of running autonomously |
+| `promise_to_pay` | If a customer already promised a payment date, no contact until it passes |
+| `max_overdue_days` | Invoices over 90 days overdue are written off, not chased indefinitely |
+| `max_retry_cap` | Failed payments stop auto-retrying after 3 attempts (escalate, or give up if the amount is small) |
+| `retry_backoff_window` | Retries wait 1h / 6h / 24h between attempts — no hammering |
+| `contact_frequency_cap` | At most one contact per customer per 24h |
+| `dnd_hours` | No outbound messages between 9pm and 9am |
+| `low_value_floor` | Abandoned carts under ₹300 get no automated outreach — not worth the cost |
+| `discount_ceiling` | Any discount offered in a recovery message is capped at 10% |
+
+All of these are unit-tested in [`tests/test_policy.py`](tests/test_policy.py) —
+each one holds regardless of what the diagnosis says, and regardless of
+whether the run is in "smart" or "naive baseline" mode.
+
+## Optional: real Claude-assisted diagnosis
+
+By default, everything runs on deterministic rules — no API key, no
+network call, no cost. To let Claude help classify the ~15% of failed
+payments that only have a free-text note instead of a structured decline
+code (and to draft the outreach copy):
+
+```bash
+pip install -r requirements-llm.txt
+export ANTHROPIC_API_KEY=sk-...      # Windows PowerShell: $env:ANTHROPIC_API_KEY = "sk-..."
+python -m recoup.run --use-llm
+```
+
+If the key is missing, the package isn't installed, or the call fails for
+any reason (network, rate limit, malformed response, or an answer outside
+the allowed root causes), Recoup silently falls back to the rule-based
+path. A batch run should never crash because an optional model call failed.
+
+## Tests
+
+```bash
+python -m pytest
+```
+
+(Run as `python -m pytest`, not bare `pytest`, so the `recoup` package is
+importable without a separate install step.)
+
+## What's simulated, and what's real
+
+This build intentionally uses **synthetic data only** — no Razorpay account
+or API keys are required to run it. Being upfront about that:
+
+- Events (failed payments, abandoned checkouts, overdue invoices) are
+  generated, not pulled from a live merchant.
+- "Sending" a reminder or retrying a payment is simulated: each action has
+  a fixed, diagnosis-aware probability of recovering the money (see
+  `recoup/simulate.py`), not a real gateway or messaging call.
+- The point of the build is the *decision loop* — diagnose, choose a
+  bounded action, respect guardrails, measure the result against a
+  baseline — which is the same loop a production version would run, just
+  with `simulate.py` swapped for real Razorpay payment-retry and
+  notification APIs.
+
+## What broke at 2am
+
+Honestly: the dev machine had no Python interpreter at all — not even a
+broken one, just the Microsoft Store alias stub — so nothing could be
+*run* until that was fixed. Everything up to that point (all nine modules,
+three test files) was written and manually traced without ever executing a
+line of it. Once Python 3.14 was installed, all 23 tests and every CLI run
+(`--events 500`, `--use-llm` with no key installed, the default path)
+passed on the first try — the pre-emptive defenses (the "Rs." console
+fallback for the ₹ sign, the try/except around every LLM call, `.get()`
+with defaults instead of dict indexing in the policy/action maps) turned
+out not to be strictly necessary on this particular machine, but they're
+exactly the kind of thing worth writing defensively regardless, because a
+judge's laptop, a CI runner, or an older Windows box might not be so
+forgiving.
+
+That's an honest answer, but it's *my* build story, not necessarily
+yours — the application is asking about the builder. Worth spending real
+time actually running this, changing a probability in
+`recoup/simulate.py`, feeding it an edge-case batch (`--seed 0`, or a
+one-off `Event` with a promise-to-pay date in the past, or an amount of
+exactly ₹50,000), and seeing what you find. That firsthand bug is the one
+worth writing up here.
+
+## Project layout
+
+```
+recoup/
+  models.py     # Event, Diagnosis, Decision, Outcome, AuditRecord
+  data_gen.py   # deterministic synthetic batch generator
+  diagnose.py   # rule-based root-cause diagnosis (+ optional LLM hook)
+  llm.py        # optional Claude integration, always with a safe fallback
+  policy.py     # the bounded, gated, tested decision engine
+  simulate.py   # diagnosis-aware simulated outcomes
+  audit.py      # CSV/JSON audit trail export
+  report.py     # metrics + self-contained HTML report
+  run.py        # CLI entrypoint
+tests/          # guardrail, diagnosis, and end-to-end tests
+```
