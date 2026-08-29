@@ -16,10 +16,10 @@ from typing import List, Optional
 
 from . import audit, report
 from . import diagnose as diagnose_module
-from . import simulate as simulate_module
 from .data_gen import generate_batch
 from .models import AuditRecord, Event
 from .policy import decide
+from .simulate import RecoveryExecutor, SimulatedExecutor
 
 if sys.platform == "win32":
     # Windows console codepages often can't encode the rupee sign; never let
@@ -32,14 +32,22 @@ if sys.platform == "win32":
 
 
 def run_policy(
-    events: List[Event], *, smart: bool, use_llm: bool, now: datetime, seed: int
+    events: List[Event], *, smart: bool, use_llm: bool, now: datetime,
+    draws: List[float], executor: RecoveryExecutor,
 ) -> List[AuditRecord]:
-    rng = random.Random(seed if smart else seed + 1)
+    """Run one policy (smart or naive baseline) over a batch.
+
+    `draws` is one pre-generated uniform random number per event. Pass the
+    *same* `draws` list to both the smart and baseline runs over the same
+    `events` (see main() below) so that any difference in outcome is
+    attributable to the difference in chosen action, not to the two runs
+    independently getting luckier or unluckier random draws.
+    """
     records: List[AuditRecord] = []
-    for event in events:
+    for event, u in zip(events, draws):
         diagnosis = diagnose_module.diagnose(event, use_llm=use_llm if smart else False)
         decision = decide(event, diagnosis, now=now, smart=smart)
-        outcome = simulate_module.simulate(event, diagnosis.root_cause, decision.action, rng)
+        outcome = executor.execute(event, diagnosis.root_cause, decision.action, u)
         records.append(AuditRecord(
             event=event, diagnosis=diagnosis, decision=decision, outcome=outcome,
             policy_name="smart" if smart else "naive_baseline", timestamp=now,
@@ -68,8 +76,14 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     events = generate_batch(n=args.events, seed=args.seed, now=now)
 
-    smart_records = run_policy(events, smart=True, use_llm=args.use_llm, now=now, seed=args.seed)
-    baseline_records = run_policy(events, smart=False, use_llm=False, now=now, seed=args.seed)
+    executor = SimulatedExecutor()
+    draw_rng = random.Random(args.seed)
+    draws = [draw_rng.random() for _ in events]
+
+    smart_records = run_policy(events, smart=True, use_llm=args.use_llm, now=now,
+                                draws=draws, executor=executor)
+    baseline_records = run_policy(events, smart=False, use_llm=False, now=now,
+                                   draws=draws, executor=executor)
 
     audit.write_csv(smart_records, args.out / "audit_trail.csv")
     audit.write_json(smart_records, args.out / "audit_trail.json")

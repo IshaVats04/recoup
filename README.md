@@ -26,7 +26,7 @@ fired along the way.
 flowchart LR
     A[Synthetic event\nfailed payment / cart drop-off / overdue invoice] --> B[Diagnose\nrule-based, optional LLM\nfor ambiguous notes]
     B --> C[Policy\nbounded action whitelist\n+ compliance guardrails]
-    C --> D[Simulate\ndiagnosis-aware outcome]
+    C --> D[RecoveryExecutor\nSimulatedExecutor today,\nRazorpayTestModeExecutor sketch]
     D --> E[Audit trail\nCSV + JSON]
     D --> F[Report\nsmart vs. naive baseline]
 ```
@@ -37,6 +37,11 @@ draft the customer-facing message text for an action the policy already
 chose. It never picks the action. The policy engine is plain deterministic
 Python so every guardrail can be — and is — unit tested independent of any
 model call.
+
+The step after "decide" is behind a `RecoveryExecutor` interface
+([`recoup/simulate.py`](recoup/simulate.py)), not a bare function — see
+["Architecture: the executor seam"](#architecture-the-executor-seam) below
+for why that's the one abstraction this build deliberately adds.
 
 ## Quickstart
 
@@ -58,18 +63,97 @@ python -m recoup.run --events 500 --seed 7   # bigger batch, different seed
 python -m recoup.run --use-llm               # see "Optional LLM mode" below
 ```
 
+Two more entry points, covered in their own sections below:
+
+```bash
+python -m recoup.evaluate   # smart vs. baseline, averaged over 100 batches, not just one
+python -m recoup.trace      # watch one ambiguous event go through diagnosis -> policy -> outcome
+```
+
 ## What the numbers mean
 
-Every batch is run twice on the *same* events: once through Recoup's
-diagnosis-driven policy, once through a naive baseline that always applies
-one fixed action per category (e.g. always `retry_now` on a failed payment)
-regardless of root cause. Both runs obey identical guardrails — the
-baseline is naive about *which action to pick*, not about compliance. The
-report's headline number is the gap between them: how much diagnosis-driven
-targeting actually recovers over "just retry/remind everything."
+Every batch is run twice on the *same* events, sharing the *same* random
+draws: once through Recoup's diagnosis-driven policy, once through a naive
+baseline that always applies one fixed action per category (e.g. always
+`retry_now` on a failed payment) regardless of root cause. Both runs obey
+identical guardrails — the baseline is naive about *which action to pick*,
+not about compliance. The report's headline number is the gap between
+them: how much diagnosis-driven targeting actually recovers over "just
+retry/remind everything."
+
+"Sharing the same random draws" is worth being explicit about: each event
+gets one random number (`u`), generated once, and *both* policies are
+scored against that same `u` when they simulate an outcome (see
+[`recoup/simulate.py`](recoup/simulate.py)). That's a "common random
+numbers" comparison — if smart and baseline happen to pick the same action
+for an event, they get the identical outcome; if they pick different
+actions, the only thing that can explain a different result is the action,
+not one run getting luckier draws than the other.
+[`tests/test_end_to_end.py`](tests/test_end_to_end.py) checks this
+property directly.
 
 The event batch and both policy runs are deterministic given `--seed`, so
-the same command reproduces the same report every time.
+the same command reproduces the same report every time — but one seed is
+still one sample. See `python -m recoup.evaluate` below for the
+many-batches version of this same comparison.
+
+## Multi-batch evaluation
+
+One seed is one sample — even an honest one can look cherry-picked. `python
+-m recoup.run` reports a single batch; `python -m recoup.evaluate` runs the
+*same* smart-vs-baseline comparison over many independent batches and
+averages it:
+
+```bash
+python -m recoup.evaluate
+# Ran 100 batches x 500 events (50,000 events total)
+#
+# Smart average recovery rate:    14.3%  (min 9.7%, max 20.3%)
+# Naive average recovery rate:     6.4%  (min 4.3%, max 9.3%)
+#
+# Incremental recovery:          +8.0 percentage points
+# Smart beat naive in 100/100 batches (100%)
+```
+
+That last line is the one that matters most: it's not just that the
+*average* is better, it's that diagnosis-driven targeting won on every
+single one of 100 independently-generated batches. Runs in about two
+seconds on 50,000 events, with `--batches` and `--events-per-batch` to
+adjust the sample size.
+
+## Seeing the AI step
+
+The aggregate numbers above don't make it obvious that an LLM is actually
+in the loop anywhere. `python -m recoup.trace` runs one illustrative,
+ambiguous event through the full pipeline and prints every stage:
+
+```bash
+python -m recoup.trace --use-llm
+# Event: failed UPI payment, Rs. 2,499
+# Note:  "I've tried paying twice but UPI keeps failing."
+#   |
+#   v
+# Claude
+#   -> root_cause: upi_mandate_failed
+#   -> confidence: 0.91
+#   -> rationale:  ...
+#   |
+#   v
+# Policy
+#   -> guardrail 'dispute_routing': passed
+#   -> guardrail 'high_value_threshold': passed
+#   -> guardrail 'dnd_hours': passed
+#   -> action: send_update_payment_link
+#   |
+#   v
+# Simulated outcome
+#   -> recovered: True
+#   -> amount:    Rs. 2,499
+```
+
+Without `--use-llm` (or without a key), the same trace runs against the
+rule engine instead, and says so explicitly — it never silently pretends
+the LLM classified something it didn't.
 
 ## Guardrails / stopping rules
 
@@ -117,6 +201,35 @@ python -m pytest
 (Run as `python -m pytest`, not bare `pytest`, so the `recoup` package is
 importable without a separate install step.)
 
+## Architecture: the executor seam
+
+Everything from "diagnose" through "decide" produces a plain `Decision` —
+an action, chosen from the whitelist, with guardrails already checked.
+What happens *with* that decision is behind one interface:
+
+```python
+class RecoveryExecutor(ABC):
+    def execute(self, event, root_cause, action, u) -> Outcome: ...
+```
+
+`SimulatedExecutor` ([`recoup/simulate.py`](recoup/simulate.py)) is the
+only implementation that actually runs in this build — no accounts, no
+network calls, a fixed diagnosis-aware probability table standing in for
+a real outcome. `RazorpayTestModeExecutor`
+([`recoup/razorpay_adapter.py`](recoup/razorpay_adapter.py)) is a second,
+*intentionally unimplemented* one: it shows exactly which four action
+groups would need a real API call (payment retry, payment links,
+notifications, human handoff) and raises `NotImplementedError` on each,
+rather than faking a Razorpay integration that was never actually tested
+against a real account. Swapping executors doesn't touch `diagnose.py`,
+`policy.py`, `audit.py`, or `report.py` at all — that's the point of
+drawing the line here instead of anywhere else.
+
+This is the one abstraction the codebase adds beyond what today's
+synthetic-data scope strictly needs, and it's added for a specific
+reason: it's the seam a real integration would actually plug into, made
+concrete instead of asserted.
+
 ## What's simulated, and what's real
 
 This build intentionally uses **synthetic data only** — no Razorpay account
@@ -130,8 +243,8 @@ or API keys are required to run it. Being upfront about that:
 - The point of the build is the *decision loop* — diagnose, choose a
   bounded action, respect guardrails, measure the result against a
   baseline — which is the same loop a production version would run, just
-  with `simulate.py` swapped for real Razorpay payment-retry and
-  notification APIs.
+  with `SimulatedExecutor` swapped for a real `RecoveryExecutor`
+  implementation (see "Architecture: the executor seam" above).
 
 ## What broke at 2am
 
@@ -161,14 +274,17 @@ worth writing up here.
 
 ```
 recoup/
-  models.py     # Event, Diagnosis, Decision, Outcome, AuditRecord
-  data_gen.py   # deterministic synthetic batch generator
-  diagnose.py   # rule-based root-cause diagnosis (+ optional LLM hook)
-  llm.py        # optional Claude integration, always with a safe fallback
-  policy.py     # the bounded, gated, tested decision engine
-  simulate.py   # diagnosis-aware simulated outcomes
-  audit.py      # CSV/JSON audit trail export
-  report.py     # metrics + self-contained HTML report
-  run.py        # CLI entrypoint
-tests/          # guardrail, diagnosis, and end-to-end tests
+  models.py            # Event, Diagnosis, Decision, Outcome, AuditRecord
+  data_gen.py           # deterministic synthetic batch generator
+  diagnose.py           # rule-based root-cause diagnosis (+ optional LLM hook)
+  llm.py                # optional Claude integration, always with a safe fallback
+  policy.py             # the bounded, gated, tested decision engine
+  simulate.py           # RecoveryExecutor interface + SimulatedExecutor
+  razorpay_adapter.py   # RazorpayTestModeExecutor - documented stub, not wired up
+  audit.py              # CSV/JSON audit trail export
+  report.py             # metrics + self-contained HTML report
+  run.py                # CLI entrypoint - one batch, smart vs. baseline
+  evaluate.py           # CLI entrypoint - many batches, averaged
+  trace.py              # CLI entrypoint - one event, every pipeline stage printed
+tests/                  # guardrail, diagnosis, executor, and end-to-end tests
 ```
