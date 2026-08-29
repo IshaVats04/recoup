@@ -246,29 +246,7 @@ or API keys are required to run it. Being upfront about that:
   with `SimulatedExecutor` swapped for a real `RecoveryExecutor`
   implementation (see "Architecture: the executor seam" above).
 
-## What broke at 2am
 
-Honestly: the dev machine had no Python interpreter at all — not even a
-broken one, just the Microsoft Store alias stub — so nothing could be
-*run* until that was fixed. Everything up to that point (all nine modules,
-three test files) was written and manually traced without ever executing a
-line of it. Once Python 3.14 was installed, all 23 tests and every CLI run
-(`--events 500`, `--use-llm` with no key installed, the default path)
-passed on the first try — the pre-emptive defenses (the "Rs." console
-fallback for the ₹ sign, the try/except around every LLM call, `.get()`
-with defaults instead of dict indexing in the policy/action maps) turned
-out not to be strictly necessary on this particular machine, but they're
-exactly the kind of thing worth writing defensively regardless, because a
-judge's laptop, a CI runner, or an older Windows box might not be so
-forgiving.
-
-That's an honest answer, but it's *my* build story, not necessarily
-yours — the application is asking about the builder. Worth spending real
-time actually running this, changing a probability in
-`recoup/simulate.py`, feeding it an edge-case batch (`--seed 0`, or a
-one-off `Event` with a promise-to-pay date in the past, or an amount of
-exactly ₹50,000), and seeing what you find. That firsthand bug is the one
-worth writing up here.
 
 ## Project layout
 
